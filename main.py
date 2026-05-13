@@ -1,6 +1,3 @@
-
-Copy
-
 import asyncio
 import logging
 import sys
