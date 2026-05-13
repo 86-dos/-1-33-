@@ -52,7 +52,6 @@ async def init_db():
                 user_id INTEGER
             )
         """)
-        # Таблица логов транзакций
         await db.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +111,15 @@ async def get_user_id(identifier: str):
             row = await cur.fetchone()
 
     return row[0] if row else None
+
+
+async def user_exists(user_id: int) -> bool:
+    """Проверяет, существует ли пользователь в базе."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
 
 
 # =========================
@@ -195,6 +203,10 @@ async def add(message: Message):
     if target is None:
         return await message.answer("❌ Пользователь не найден")
 
+    # FIX: проверяем, что target действительно существует в базе
+    if not await user_exists(target):
+        return await message.answer("❌ Пользователь не зарегистрирован в боте")
+
     try:
         amount = float(parts[2])
     except ValueError:
@@ -204,9 +216,6 @@ async def add(message: Message):
         return await message.answer("⚠️ Сумма должна быть > 0")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,)
-        )
         await db.execute(
             "UPDATE users SET balance = balance + ? WHERE user_id = ?",
             (amount, target)
@@ -233,6 +242,10 @@ async def take(message: Message):
     if target is None:
         return await message.answer("❌ Пользователь не найден")
 
+    # FIX: проверяем существование пользователя
+    if not await user_exists(target):
+        return await message.answer("❌ Пользователь не зарегистрирован в боте")
+
     try:
         amount = float(parts[2])
     except ValueError:
@@ -256,7 +269,8 @@ async def take(message: Message):
             "UPDATE users SET balance = balance - ? WHERE user_id = ?",
             (amount, target)
         )
-        await log_transaction(db, "TAKE", from_user=target, to_user=message.from_user.id, amount=amount)
+        # FIX: to_user=None, деньги никуда не идут — это явное списание администратором
+        await log_transaction(db, "TAKE", from_user=target, to_user=None, amount=amount)
         await db.commit()
 
     await message.answer(f"✅ Снято <b>-{amount:.2f}$</b> у пользователя <code>{target}</code>")
@@ -300,6 +314,22 @@ async def withdraw(message: Message):
 
     await message.answer(f"💸 Вывод выполнен: <b>-{amount:.2f}$</b>")
 
+    # Уведомляем всех администраторов о запросе на вывод
+    bot: Bot = dp["bot"] if "bot" in dp else None
+    # Уведомление отправляется отдельно после коммита, ошибка не должна откатить транзакцию
+    try:
+        nick = message.from_user.username or str(uid)
+        for admin_id in ADMINS:
+            if bot:
+                await bot.send_message(
+                    admin_id,
+                    f"🏧 <b>Запрос на вывод</b>\n"
+                    f"👤 Пользователь: @{nick} (<code>{uid}</code>)\n"
+                    f"💵 Сумма: <b>{amount:.2f}$</b>"
+                )
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось уведомить админа о выводе: {e}")
+
 
 @dp.message(Command("pay"))
 async def pay(message: Message):
@@ -312,6 +342,10 @@ async def pay(message: Message):
     target = await get_user_id(parts[1])
     if target is None:
         return await message.answer("❌ Пользователь не найден")
+
+    # FIX: проверяем, что получатель действительно зарегистрирован в боте
+    if not await user_exists(target):
+        return await message.answer("❌ Получатель не зарегистрирован в боте")
 
     try:
         amount = float(parts[2])
@@ -337,11 +371,9 @@ async def pay(message: Message):
         if bal < amount:
             return await message.answer("❌ Недостаточно средств на балансе")
 
+        # FIX: убран ручной BEGIN — aiosqlite управляет транзакцией сам.
+        # При ошибке соединение закроется и транзакция автоматически откатится.
         try:
-            await db.execute("BEGIN")
-            await db.execute(
-                "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target,)
-            )
             await db.execute(
                 "UPDATE users SET balance = balance - ? WHERE user_id = ?",
                 (amount, sender)
@@ -353,7 +385,6 @@ async def pay(message: Message):
             await log_transaction(db, "PAY", from_user=sender, to_user=target, amount=amount)
             await db.commit()
         except Exception as e:
-            await db.rollback()
             logger.error(f"❌ [PAY] Transaction failed: {e}")
             return await message.answer("❌ Ошибка транзакции, попробуй ещё раз")
 
@@ -366,9 +397,11 @@ async def top(message: Message):
     logger.info(f"🏆 /top — user={message.from_user.id}")
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # FIX: исключаем пользователей с нулевым балансом
         async with db.execute("""
             SELECT nickname, balance
             FROM users
+            WHERE balance > 0
             ORDER BY balance DESC
             LIMIT 10
         """) as cur:
@@ -394,7 +427,6 @@ async def history(message: Message):
     await save_user(message)
     uid = message.from_user.id
 
-    # Только админы, только в личке с ботом
     if uid not in ADMINS:
         logger.warning(f"🚫 /history — unauthorized user={uid}")
         return
@@ -403,19 +435,35 @@ async def history(message: Message):
         logger.warning(f"🚫 /history — attempted in group by user={uid}")
         return await message.answer("🔒 Эта команда доступна только в личке с ботом")
 
-    logger.info(f"📋 /history — admin={uid}")
+    # Поддержка пагинации: /history 2 — вторая страница
+    parts = message.text.split()
+    page = 1
+    if len(parts) > 1 and parts[1].isdigit():
+        page = max(1, int(parts[1]))
+
+    limit = 20
+    offset = (page - 1) * limit
+
+    logger.info(f"📋 /history — admin={uid} page={page}")
 
     async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
         async with db.execute("""
             SELECT type, from_user, to_user, amount, created_at
             FROM transactions
             ORDER BY id DESC
-            LIMIT 20
-        """) as cur:
+            LIMIT ? OFFSET ?
+        """, (limit, offset)) as cur:
             rows = await cur.fetchall()
 
     if not rows:
         return await message.answer("📭 История транзакций пуста")
+
+    total_pages = (total + limit - 1) // limit
 
     icons = {
         "PAY": "💸",
@@ -424,12 +472,15 @@ async def history(message: Message):
         "WITHDRAW": "🏧",
     }
 
-    text = "📋 <b>Все транзакции (последние 20)</b>\n\n"
+    text = f"📋 <b>Транзакции — страница {page}/{total_pages}</b>\n\n"
     for r in rows:
         type_, from_u, to_u, amount, created_at = r
         icon = icons.get(type_, "🔄")
         to_str = f"→ <code>{to_u}</code>" if to_u else ""
         text += f"{icon} <b>{type_}</b> | <code>{from_u}</code> {to_str} | <b>{amount:.2f}$</b> | {created_at}\n"
+
+    if total_pages > 1:
+        text += f"\n📌 Следующая страница: /history {page + 1}" if page < total_pages else ""
 
     await message.answer(text)
 
@@ -447,7 +498,7 @@ async def help_cmd(message: Message):
         "🔐 <b>Только для админов (в личке):</b>\n"
         "➕ /add @user &lt;сумма&gt;\n"
         "➖ /take @user &lt;сумма&gt;\n"
-        "📋 /history — все транзакции"
+        "📋 /history [страница] — все транзакции"
     )
 
 
@@ -486,6 +537,9 @@ async def main():
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+
+    # Сохраняем bot в dp для доступа из хэндлеров (используется в /withdraw)
+    dp["bot"] = bot
 
     await run_web_server()
     logger.info("🤖 Bot started")
