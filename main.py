@@ -44,7 +44,8 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 nickname TEXT,
                 balance REAL DEFAULT 0,
-                bank REAL DEFAULT 0
+                bank REAL DEFAULT 0,
+                registered INTEGER DEFAULT 0
             )
         """)
         await db.execute("""
@@ -65,12 +66,16 @@ async def init_db():
         """)
         await db.commit()
 
-        # Миграция для старых баз — добавляем колонку bank если нет
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0")
-            await db.commit()
-        except Exception:
-            pass
+        # Миграция для старых баз — добавляем колонки если нет
+        for migration in [
+            "ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN registered INTEGER DEFAULT 0",
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass
 
     logger.info("✅ Database initialized")
 
@@ -89,6 +94,7 @@ async def log_transaction(db, type_: str, from_user, to_user, amount: float):
 # UTILS
 # =========================
 async def save_user(message: Message):
+    """Создаёт запись в БД если её нет. НЕ ставит registered=1."""
     if not message or not message.from_user:
         return
 
@@ -123,10 +129,10 @@ async def get_user_id(identifier: str):
 
 
 async def user_exists(user_id: int) -> bool:
-    """Проверяет, существует ли пользователь в базе."""
+    """Проверяет, прошёл ли пользователь регистрацию (/start)."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+            "SELECT 1 FROM users WHERE user_id = ? AND registered = 1", (user_id,)
         ) as cur:
             return await cur.fetchone() is not None
 
@@ -140,10 +146,20 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def start(message: Message):
     await save_user(message)
-    logger.info(f"👋 /start — user={message.from_user.id}")
+    uid = message.from_user.id
+
+    # Ставим флаг регистрации
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET registered = 1 WHERE user_id = ?", (uid,)
+        )
+        await db.commit()
+
+    logger.info(f"👋 /start — user={uid}")
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "🤖 Бот запущен и готов к работе.\n"
+        "✅ Ты успешно зарегистрирован в системе.\n"
+        "🤖 Бот готов к работе.\n"
         "📖 Используй /help чтобы увидеть все команды."
     )
 
@@ -151,12 +167,16 @@ async def start(message: Message):
 @dp.message(Command("profile"))
 async def profile(message: Message):
     await save_user(message)
-    logger.info(f"👤 /profile — user={message.from_user.id}")
+    uid = message.from_user.id
+    logger.info(f"👤 /profile — user={uid}")
+
+    if not await user_exists(uid):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT nickname, balance, bank FROM users WHERE user_id = ?",
-            (message.from_user.id,)
+            (uid,)
         ) as cur:
             row = await cur.fetchone()
 
@@ -175,6 +195,10 @@ async def profile(message: Message):
 @dp.message(Command("nick"))
 async def nick(message: Message):
     await save_user(message)
+    uid = message.from_user.id
+
+    if not await user_exists(uid):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -190,11 +214,11 @@ async def nick(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET nickname = ? WHERE user_id = ?",
-            (new_nick, message.from_user.id)
+            (new_nick, uid)
         )
         await db.commit()
 
-    logger.info(f"✏️ /nick — user={message.from_user.id} new_nick={new_nick}")
+    logger.info(f"✏️ /nick — user={uid} new_nick={new_nick}")
     await message.answer(f"✅ Никнейм обновлён: <b>{new_nick}</b>")
 
 
@@ -307,6 +331,10 @@ async def take(message: Message):
 @dp.message(Command("withdraw"))
 async def withdraw(message: Message):
     await save_user(message)
+    uid = message.from_user.id
+
+    if not await user_exists(uid):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -319,8 +347,6 @@ async def withdraw(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -343,16 +369,15 @@ async def withdraw(message: Message):
     await message.answer(f"💸 Вывод выполнен: <b>-{amount:.2f}$</b>")
 
     # Уведомляем всех администраторов о запросе на вывод
-    bot: Bot = dp["bot"] if "bot" in dp else None
-    # Уведомление отправляется отдельно после коммита, ошибка не должна откатить транзакцию
+    bot: Bot = dp.get("bot")
     try:
-        nick = message.from_user.username or str(uid)
+        nick_str = message.from_user.username or str(uid)
         for admin_id in ADMINS:
             if bot:
                 await bot.send_message(
                     admin_id,
                     f"🏧 <b>Запрос на вывод</b>\n"
-                    f"👤 Пользователь: @{nick} (<code>{uid}</code>)\n"
+                    f"👤 Пользователь: @{nick_str} (<code>{uid}</code>)\n"
                     f"💵 Сумма: <b>{amount:.2f}$</b>"
                 )
     except Exception as e:
@@ -362,6 +387,10 @@ async def withdraw(message: Message):
 @dp.message(Command("pay"))
 async def pay(message: Message):
     await save_user(message)
+    sender = message.from_user.id
+
+    if not await user_exists(sender):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     parts = message.text.split()
     reply = message.reply_to_message
@@ -391,8 +420,6 @@ async def pay(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    sender = message.from_user.id
 
     if sender == target:
         return await message.answer("⚠️ Нельзя переводить самому себе")
@@ -435,7 +462,7 @@ async def top(message: Message):
         async with db.execute("""
             SELECT nickname, balance
             FROM users
-            WHERE balance > 0
+            WHERE balance > 0 AND registered = 1
             ORDER BY balance DESC
             LIMIT 10
         """) as cur:
@@ -503,6 +530,8 @@ async def history(message: Message):
         "ADD": "➕",
         "TAKE": "➖",
         "WITHDRAW": "🏧",
+        "DEPOSIT": "🏦",
+        "BANKWITHDRAW": "🏦",
     }
 
     text = f"📋 <b>Транзакции — страница {page}/{total_pages}</b>\n\n"
@@ -521,6 +550,10 @@ async def history(message: Message):
 @dp.message(Command("deposit"))
 async def deposit(message: Message):
     await save_user(message)
+    uid = message.from_user.id
+
+    if not await user_exists(uid):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -533,8 +566,6 @@ async def deposit(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -561,6 +592,10 @@ async def deposit(message: Message):
 @dp.message(Command("bankwithdraw"))
 async def bankwithdraw(message: Message):
     await save_user(message)
+    uid = message.from_user.id
+
+    if not await user_exists(uid):
+        return await message.answer("❌ Ты не зарегистрирован. Напиши /start")
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -573,8 +608,6 @@ async def bankwithdraw(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -693,16 +726,13 @@ async def reset_all_balances(message: Message):
     uid = message.from_user.id
 
     if uid not in ADMINS:
-        # Молча игнорируем — не раскрываем существование команды
         return
 
-    # Только в личке
     if message.chat.type != "private":
         return
 
     parts = message.text.split()
 
-    # Требуем явное подтверждение: /resetallbalances_x7k2m CONFIRM
     if len(parts) < 2 or parts[1] != "CONFIRM":
         return await message.answer(
             "⚠️ Для подтверждения сброса ВСЕХ балансов введи:\n"
