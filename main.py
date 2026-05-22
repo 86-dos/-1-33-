@@ -118,7 +118,7 @@ async def save_user(message: Message):
     if message.entities:
         for entity in message.entities:
             # text_mention — кликабельное имя; содержит полный объект User с ID
-            if entity.type.value == "text_mention" and entity.user:
+            if entity.type == "text_mention" and entity.user:
                 u = entity.user
                 await ensure_user(u.id, u.username)
 
@@ -146,7 +146,7 @@ async def get_user_id(identifier: str):
     return row[0] if row else None
 
 
-def get_text_mention_target(message: Message) -> int | None:
+def get_text_mention_target(message: Message):
     """
     Извлекает user_id из первого text_mention entity в сообщении.
     Нужно для команд вида /add @Имя 100 когда у юзера нет @username.
@@ -154,7 +154,7 @@ def get_text_mention_target(message: Message) -> int | None:
     if not message.entities:
         return None
     for entity in message.entities:
-        if entity.type.value == "text_mention" and entity.user:
+        if entity.type == "text_mention" and entity.user:
             return entity.user.id
     return None
 
