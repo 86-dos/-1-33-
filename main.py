@@ -127,7 +127,8 @@ async def save_reply_user(message: Message):
     """Сохраняет юзера из reply_to_message если есть."""
     if message.reply_to_message and message.reply_to_message.from_user:
         ru = message.reply_to_message.from_user
-        await ensure_user(ru.id, ru.username)
+        if not ru.is_bot:
+            await ensure_user(ru.id, ru.username)
 
 
 async def get_user_id(identifier: str):
@@ -239,10 +240,9 @@ async def add(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    if reply and reply.from_user:
+    if reply and reply.from_user and not reply.from_user.is_bot:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /add 100")
-        # ФИКС: сохраняем юзера из реплая — это главный сценарий в группах
         await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
@@ -290,10 +290,9 @@ async def take(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    if reply and reply.from_user:
+    if reply and reply.from_user and not reply.from_user.is_bot:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /take 100")
-        # ФИКС: сохраняем юзера из реплая
         await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
@@ -400,10 +399,9 @@ async def pay(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    if reply and reply.from_user:
+    if reply and reply.from_user and not reply.from_user.is_bot:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /pay 100")
-        # ФИКС: сохраняем юзера из реплая
         await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
@@ -659,8 +657,7 @@ async def checkprofile(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    if reply and reply.from_user:
-        # ФИКС: сохраняем юзера из реплая
+    if reply and reply.from_user and not reply.from_user.is_bot:
         await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         if target == uid:
@@ -721,6 +718,31 @@ async def checkprofile(message: Message):
 
     logger.info(f"🔍 /checkprofile — admin={uid} target={target}")
     await message.answer(text)
+
+
+@dp.message(Command("resetusernames"))
+async def reset_usernames(message: Message):
+    await save_user(message)
+    uid = message.from_user.id
+
+    if uid not in ADMINS:
+        return
+
+    if message.chat.type != "private":
+        return await message.answer("🔒 Только в личке")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM usernames") as cur:
+            count = (await cur.fetchone())[0]
+        await db.execute("DELETE FROM usernames")
+        await db.commit()
+
+    logger.warning(f"🔴 RESET USERNAMES — admin={uid}, deleted={count}")
+    await message.answer(
+        f"✅ Таблица usernames очищена.\n"
+        f"🗑 Удалено записей: <b>{count}</b>\n\n"
+        f"Теперь пусть юзеры напишут что-нибудь в группе — бот пересохранит их заново."
+    )
 
 
 @dp.message(Command("resetallbalances_x7k2m"))
