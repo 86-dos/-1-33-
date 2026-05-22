@@ -65,7 +65,6 @@ async def init_db():
         """)
         await db.commit()
 
-        # Миграция для старых баз
         for migration in [
             "ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0",
         ]:
@@ -74,8 +73,6 @@ async def init_db():
                 await db.commit()
             except Exception:
                 pass
-
-        # Удаляем колонку registered если осталась (SQLite не поддерживает DROP COLUMN до 3.35, просто игнорим)
 
     logger.info("✅ Database initialized")
 
@@ -93,7 +90,6 @@ async def log_transaction(db, type_: str, from_user, to_user, amount: float):
 # UTILS
 # =========================
 async def ensure_user(uid: int, username: str = None):
-    """Создаёт пользователя в БД если его нет. Регистрация не нужна."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,)
@@ -107,12 +103,35 @@ async def ensure_user(uid: int, username: str = None):
 
 
 async def save_user(message: Message):
+    """
+    Сохраняет отправителя + всех упомянутых через text_mention entity.
+    text_mention — это когда Telegram создаёт кликабельное имя для юзера БЕЗ @username.
+    Обычный @username (тип 'mention') не содержит объект User в entity — только текст.
+    """
     if not message or not message.from_user:
         return
-    await ensure_user(message.from_user.id, message.from_user.username)
+
+    fu = message.from_user
+    await ensure_user(fu.id, fu.username)
+
+    # ФИКС ДЛЯ ГРУПП: сохраняем всех упомянутых через text_mention
+    if message.entities:
+        for entity in message.entities:
+            # text_mention — кликабельное имя; содержит полный объект User с ID
+            if entity.type.value == "text_mention" and entity.user:
+                u = entity.user
+                await ensure_user(u.id, u.username)
+
+
+async def save_reply_user(message: Message):
+    """Сохраняет юзера из reply_to_message если есть."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        ru = message.reply_to_message.from_user
+        await ensure_user(ru.id, ru.username)
 
 
 async def get_user_id(identifier: str):
+    """Получает user_id по @username или числовому ID."""
     if identifier.isdigit():
         return int(identifier)
 
@@ -125,6 +144,19 @@ async def get_user_id(identifier: str):
             row = await cur.fetchone()
 
     return row[0] if row else None
+
+
+def get_text_mention_target(message: Message) -> int | None:
+    """
+    Извлекает user_id из первого text_mention entity в сообщении.
+    Нужно для команд вида /add @Имя 100 когда у юзера нет @username.
+    """
+    if not message.entities:
+        return None
+    for entity in message.entities:
+        if entity.type.value == "text_mention" and entity.user:
+            return entity.user.id
+    return None
 
 
 # =========================
@@ -210,17 +242,22 @@ async def add(message: Message):
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /add 100")
+        # ФИКС: сохраняем юзера из реплая — это главный сценарий в группах
+        await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /add @user 100\nИли ответь на сообщение игрока: /add 100")
-        target = await get_user_id(parts[1])
+
+        # ФИКС: сначала пробуем text_mention (юзер без @username)
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
 
-    # Автоматически создаём пользователя если нет
     await ensure_user(target)
 
     try:
@@ -256,12 +293,18 @@ async def take(message: Message):
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /take 100")
+        # ФИКС: сохраняем юзера из реплая
+        await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /take @user 100\nИли ответь на сообщение игрока: /take 100")
-        target = await get_user_id(parts[1])
+
+        # ФИКС: сначала пробуем text_mention
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
@@ -360,12 +403,18 @@ async def pay(message: Message):
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /pay 100")
+        # ФИКС: сохраняем юзера из реплая
+        await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
         amount_str = parts[1]
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /pay @user 100\nИли ответь на сообщение игрока: /pay 100")
-        target = await get_user_id(parts[1])
+
+        # ФИКС: сначала пробуем text_mention
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
@@ -611,17 +660,21 @@ async def checkprofile(message: Message):
     reply = message.reply_to_message
 
     if reply and reply.from_user:
+        # ФИКС: сохраняем юзера из реплая
+        await ensure_user(reply.from_user.id, reply.from_user.username)
         target = reply.from_user.id
-        # Фикс: реплай на своё сообщение → показывался профиль админа
         if target == uid:
             return await message.answer("⚠️ Это твоё собственное сообщение. Укажи другого пользователя.")
     else:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование: /checkprofile @user\nИли ответь на сообщение игрока: /checkprofile")
-        target = await get_user_id(parts[1])
+
+        # ФИКС: сначала пробуем text_mention
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
-        # Фикс: нельзя проверить самого себя через @username тоже
         if target == uid:
             return await message.answer("⚠️ Это твой собственный профиль. Используй /profile.")
 
@@ -709,6 +762,7 @@ async def reset_all_balances(message: Message):
 
 @dp.message(F.from_user)
 async def track(message: Message):
+    """Автоматически сохраняет любого юзера который пишет в чат (включая группы)."""
     await save_user(message)
 
 
