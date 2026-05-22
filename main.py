@@ -745,6 +745,44 @@ async def reset_usernames(message: Message):
     )
 
 
+@dp.message(Command("resetdb_full_x9q"))
+async def reset_db_full(message: Message):
+    """Полный сброс БД — удаляет всех юзеров и username маппинги. Балансы тоже слетят."""
+    await save_user(message)
+    uid = message.from_user.id
+
+    if uid not in ADMINS:
+        return
+
+    if message.chat.type != "private":
+        return await message.answer("🔒 Только в личке")
+
+    parts = message.text.split()
+    if len(parts) < 2 or parts[1] != "CONFIRM":
+        return await message.answer(
+            "⚠️ Это удалит ВСЕХ юзеров и все username маппинги (балансы тоже слетят).\n"
+            "Для подтверждения: <code>/resetdb_full_x9q CONFIRM</code>"
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM usernames") as cur:
+            unames_count = (await cur.fetchone())[0]
+
+        await db.execute("DELETE FROM usernames")
+        await db.execute("DELETE FROM users")
+        await db.commit()
+
+    logger.warning(f"🔴 FULL DB RESET — admin={uid}, users={users_count}, usernames={unames_count}")
+    await message.answer(
+        f"✅ БД очищена полностью.\n"
+        f"👥 Удалено юзеров: <b>{users_count}</b>\n"
+        f"🔤 Удалено username записей: <b>{unames_count}</b>\n\n"
+        f"Теперь пусть все напишут в группе — бот пересохранит их заново с правильными ID."
+    )
+
+
 @dp.message(Command("resetallbalances_x7k2m"))
 async def reset_all_balances(message: Message):
     await save_user(message)
