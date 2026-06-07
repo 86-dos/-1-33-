@@ -137,6 +137,36 @@ def get_text_mention_target(message: Message):
     return None
 
 
+def parse_amount(text: str):
+    """
+    Парсит сумму с суффиксами:
+      k   → × 1 000
+      kk / m → × 1 000 000
+      b   → × 1 000 000 000
+    Примеры: 450k → 450000, 1.5kk → 1500000, 2b → 2000000000
+    Возвращает float или None при ошибке.
+    """
+    t = text.strip().lower()
+    multipliers = [
+        ("kk", 1_000_000),
+        ("mm", 1_000_000),
+        ("m",  1_000_000),
+        ("k",  1_000),
+        ("b",  1_000_000_000),
+    ]
+    for suffix, mult in multipliers:
+        if t.endswith(suffix):
+            num_str = t[:-len(suffix)]
+            try:
+                return float(num_str) * mult
+            except ValueError:
+                return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
 # =========================
 # BOT
 # =========================
@@ -234,10 +264,9 @@ async def add(message: Message):
 
     await ensure_user(target)
 
-    try:
-        amount = float(amount_str)
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
+    amount = parse_amount(amount_str)
+    if amount is None:
+        return await message.answer("⚠️ Неверная сумма. Примеры: 100, 5k, 1.5kk, 2b")
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
@@ -283,10 +312,9 @@ async def take(message: Message):
 
     await ensure_user(target)
 
-    try:
-        amount = float(amount_str)
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
+    amount = parse_amount(amount_str)
+    if amount is None:
+        return await message.answer("⚠️ Неверная сумма. Примеры: 100, 5k, 1.5kk, 2b")
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
@@ -321,10 +349,9 @@ async def withdraw(message: Message):
     if len(parts) < 2:
         return await message.answer("⚠️ Использование: /withdraw 100")
 
-    try:
-        amount = float(parts[1])
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
+    amount = parse_amount(parts[1])
+    if amount is None:
+        return await message.answer("⚠️ Неверная сумма. Примеры: 100, 5k, 1.5kk, 2b")
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
@@ -391,10 +418,9 @@ async def pay(message: Message):
 
     await ensure_user(target)
 
-    try:
-        amount = float(amount_str)
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
+    amount = parse_amount(amount_str)
+    if amount is None:
+        return await message.answer("⚠️ Неверная сумма. Примеры: 100, 5k, 1.5kk, 2b")
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
@@ -527,7 +553,8 @@ async def help_cmd(message: Message):
         "💸 /withdraw &lt;сумма&gt; — вывести деньги\n"
         "💳 /pay @user &lt;сумма&gt; — перевести деньги\n"
         "🏆 /top — топ игроков\n\n"
-        "🔐 <b>Только для админов (в личке):</b>\n"
+        "💡 <b>Форматы суммы:</b> 100, 5k, 1.5kk, 2b\n\n"
+        "🔐 <b>Только для админов:</b>\n"
         "➕ /add @user &lt;сумма&gt;\n"
         "➖ /take @user &lt;сумма&gt;\n"
         "📋 /history [страница] — все транзакции\n"
