@@ -378,7 +378,142 @@ async def take(message: Message):
     await message.answer(f"✅ Снято <b>-{amount:.2f}$</b> у пользователя <code>{target}</code>")
 
 
-@dp.message(Command("withdraw"))
+@dp.message(Command("plus"))
+async def plus(message: Message):
+    await save_user(message)
+
+    if message.from_user.id not in ADMINS:
+        logger.warning(f"🚫 /plus — unauthorized user={message.from_user.id}")
+        return
+
+    parts = message.text.split()
+    reply = message.reply_to_message
+
+    if reply and reply.from_user and not reply.from_user.is_bot:
+        if len(parts) < 2:
+            return await message.answer("⚠️ Использование (реплай): /plus 5")
+        await ensure_user(reply.from_user.id, reply.from_user.username)
+        target = reply.from_user.id
+        pct_str = parts[1]
+    else:
+        if len(parts) < 3:
+            return await message.answer("⚠️ Использование: /plus @user 5\nИли ответь на сообщение игрока: /plus 5")
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
+        if target is None:
+            return await message.answer("❌ Пользователь не найден")
+        pct_str = parts[2]
+
+    await ensure_user(target)
+
+    try:
+        pct = float(pct_str)
+    except ValueError:
+        return await message.answer("⚠️ Неверный процент. Пример: /plus @user 5")
+
+    if pct <= 0:
+        return await message.answer("⚠️ Процент должен быть > 0")
+    if pct > 1000:
+        return await message.answer("⚠️ Процент слишком большой (макс. 1000%)")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (target,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        bal = row[0] if row else 0
+
+        if bal <= 0:
+            return await message.answer("❌ У пользователя нулевой баланс, не от чего считать проценты")
+
+        added = bal * (pct / 100)
+        new_bal = bal + added
+
+        await db.execute(
+            "UPDATE users SET balance = ? WHERE user_id = ?",
+            (new_bal, target)
+        )
+        await log_transaction(db, "PLUS_PCT", from_user=message.from_user.id, to_user=target, amount=added)
+        await db.commit()
+
+    logger.info(f"📈 /plus — admin={message.from_user.id} target={target} pct={pct} added={added:.2f}")
+    await message.answer(
+        f"📈 Баланс увеличен на <b>{pct}%</b>\n"
+        f"👤 Пользователь: <code>{target}</code>\n"
+        f"💰 Было: <b>{bal:.2f}$</b>\n"
+        f"💰 Стало: <b>{new_bal:.2f}$</b> (<b>+{added:.2f}$</b>)"
+    )
+
+
+@dp.message(Command("minus"))
+async def minus(message: Message):
+    await save_user(message)
+
+    if message.from_user.id not in ADMINS:
+        logger.warning(f"🚫 /minus — unauthorized user={message.from_user.id}")
+        return
+
+    parts = message.text.split()
+    reply = message.reply_to_message
+
+    if reply and reply.from_user and not reply.from_user.is_bot:
+        if len(parts) < 2:
+            return await message.answer("⚠️ Использование (реплай): /minus 5")
+        await ensure_user(reply.from_user.id, reply.from_user.username)
+        target = reply.from_user.id
+        pct_str = parts[1]
+    else:
+        if len(parts) < 3:
+            return await message.answer("⚠️ Использование: /minus @user 5\nИли ответь на сообщение игрока: /minus 5")
+        target = get_text_mention_target(message)
+        if target is None:
+            target = await get_user_id(parts[1])
+        if target is None:
+            return await message.answer("❌ Пользователь не найден")
+        pct_str = parts[2]
+
+    await ensure_user(target)
+
+    try:
+        pct = float(pct_str)
+    except ValueError:
+        return await message.answer("⚠️ Неверный процент. Пример: /minus @user 5")
+
+    if pct <= 0:
+        return await message.answer("⚠️ Процент должен быть > 0")
+    if pct > 100:
+        return await message.answer("⚠️ Процент не может быть больше 100%")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (target,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        bal = row[0] if row else 0
+
+        if bal <= 0:
+            return await message.answer("❌ У пользователя нулевой баланс")
+
+        removed = bal * (pct / 100)
+        new_bal = bal - removed
+
+        await db.execute(
+            "UPDATE users SET balance = ? WHERE user_id = ?",
+            (new_bal, target)
+        )
+        await log_transaction(db, "MINUS_PCT", from_user=message.from_user.id, to_user=target, amount=removed)
+        await db.commit()
+
+    logger.info(f"📉 /minus — admin={message.from_user.id} target={target} pct={pct} removed={removed:.2f}")
+    await message.answer(
+        f"📉 Баланс уменьшен на <b>{pct}%</b>\n"
+        f"👤 Пользователь: <code>{target}</code>\n"
+        f"💰 Было: <b>{bal:.2f}$</b>\n"
+        f"💰 Стало: <b>{new_bal:.2f}$</b> (<b>-{removed:.2f}$</b>)"
+    )
 async def withdraw(message: Message):
     await save_user(message)
     uid = message.from_user.id
@@ -611,6 +746,8 @@ async def help_cmd(message: Message):
         "🔐 <b>Только для админов:</b>\n"
         "➕ /add @user &lt;сумма&gt;\n"
         "➖ /take @user &lt;сумма&gt;\n"
+        "📈 /plus @user &lt;%&gt; — увеличить баланс на %\n"
+        "📉 /minus @user &lt;%&gt; — уменьшить баланс на %\n"
         "📋 /history [страница] — все транзакции\n"
         "🔍 /checkprofile @user — профиль игрока"
     )
