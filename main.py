@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 
 import aiosqlite
-from aiohttp import web
+from aiohttp import web, ClientSession
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -23,6 +23,8 @@ if not API_TOKEN:
     raise ValueError("❌ BOT_TOKEN not found in Secrets")
 
 ADMINS = {6814524171, 5254144715, 5945962868}
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 DB_PATH = "economy.db"
 
@@ -165,6 +167,42 @@ def parse_amount(text: str):
         return float(t)
     except ValueError:
         return None
+
+
+async def check_news_with_gemini(year: int, news_text: str) -> str:
+    """Отправляет новость в Gemini и возвращает анализ."""
+    if not GEMINI_API_KEY:
+        return "❌ GEMINI_API_KEY не настроен в секретах"
+
+    prompt = (
+        f"Ты — редактор газеты в ролевой игре. Игрок написал новость для своей страны.\n"
+        f"Год события: {year}\n"
+        f"Текст новости: {news_text}\n\n"
+        f"Проверь новость по трём критериям и дай краткий ответ на русском:\n"
+        f"1. 📝 Грамматика и стиль — есть ли ошибки, как улучшить текст\n"
+        f"2. 🎭 Логичность для РП — реалистична ли новость для указанного года\n"
+        f"3. 💡 Советы — как сделать новость интереснее и атмосфернее\n\n"
+        f"Будь конкретным и дружелюбным. Ответ не длиннее 300 слов."
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 600, "temperature": 0.7}
+    }
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(url, json=payload, timeout=20) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.error(f"Gemini API error {resp.status}: {error}")
+                    return f"❌ Ошибка API ({resp.status}). Попробуй позже."
+                data = await resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logger.error(f"Gemini request failed: {e}")
+        return "❌ Не удалось связаться с ИИ. Попробуй позже."
 
 
 # =========================
@@ -456,6 +494,21 @@ async def pay(message: Message):
 
     await message.answer(f"✅ Перевод выполнен: <b>{amount:.2f}$</b> → <code>{target}</code>")
 
+    bot: Bot = dp.get("bot")
+    try:
+        sender_str = f"@{message.from_user.username}" if message.from_user.username else f"<code>{sender}</code>"
+        for admin_id in ADMINS:
+            if bot:
+                await bot.send_message(
+                    admin_id,
+                    f"💸 <b>Перевод</b>\n"
+                    f"👤 От: {sender_str} (<code>{sender}</code>)\n"
+                    f"🎯 Кому: <code>{target}</code>\n"
+                    f"💵 Сумма: <b>{amount:.2f}$</b>"
+                )
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось уведомить админа о переводе: {e}")
+
 
 @dp.message(Command("top"))
 async def top(message: Message):
@@ -552,7 +605,8 @@ async def help_cmd(message: Message):
         "✏️ /nick &lt;имя&gt; — сменить никнейм\n"
         "💸 /withdraw &lt;сумма&gt; — вывести деньги\n"
         "💳 /pay @user &lt;сумма&gt; — перевести деньги\n"
-        "🏆 /top — топ игроков\n\n"
+        "🏆 /top — топ игроков\n"
+        "📰 /checknews &lt;год&gt; &lt;текст&gt; — проверить новость через ИИ\n\n"
         "💡 <b>Форматы суммы:</b> 100, 5k, 1.5kk, 2b\n\n"
         "🔐 <b>Только для админов:</b>\n"
         "➕ /add @user &lt;сумма&gt;\n"
@@ -731,6 +785,46 @@ async def reset_all_balances(message: Message):
     await message.answer(
         f"✅ Все балансы обнулены.\n"
         f"👥 Затронуто пользователей: <b>{count}</b>"
+    )
+
+
+@dp.message(Command("checknews"))
+async def checknews(message: Message):
+    await save_user(message)
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await message.answer(
+            "⚠️ Использование: /checknews &lt;год&gt; &lt;текст новости&gt;\n"
+            "Пример: <code>/checknews 1945 Наша страна подписала мирный договор с соседями</code>"
+        )
+
+    year_str = parts[1]
+    news_text = parts[2].strip()
+
+    if not year_str.lstrip("-").isdigit():
+        return await message.answer("⚠️ Год должен быть числом. Пример: <code>/checknews 1945 текст...</code>")
+
+    year = int(year_str)
+
+    if not news_text:
+        return await message.answer("⚠️ Текст новости не может быть пустым")
+
+    if len(news_text) < 10:
+        return await message.answer("⚠️ Новость слишком короткая, напиши подробнее")
+
+    if len(news_text) > 1500:
+        return await message.answer("⚠️ Новость слишком длинная (макс. 1500 символов)")
+
+    logger.info(f"📰 /checknews — user={message.from_user.id} year={year} len={len(news_text)}")
+
+    wait_msg = await message.answer("🔍 Анализирую новость, подожди...")
+
+    result = await check_news_with_gemini(year, news_text)
+
+    await wait_msg.delete()
+    await message.answer(
+        f"📰 <b>Анализ новости ({year} год)</b>\n\n{result}"
     )
 
 
