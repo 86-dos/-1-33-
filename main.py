@@ -43,8 +43,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 nickname TEXT,
-                balance REAL DEFAULT 0,
-                bank REAL DEFAULT 0
+                balance REAL DEFAULT 0
             )
         """)
         await db.execute("""
@@ -64,15 +63,6 @@ async def init_db():
             )
         """)
         await db.commit()
-
-        for migration in [
-            "ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0",
-        ]:
-            try:
-                await db.execute(migration)
-                await db.commit()
-            except Exception:
-                pass
 
     logger.info("✅ Database initialized")
 
@@ -103,28 +93,20 @@ async def ensure_user(uid: int, username: str = None):
 
 
 async def save_user(message: Message):
-    """
-    Сохраняет отправителя + всех упомянутых через text_mention entity.
-    text_mention — это когда Telegram создаёт кликабельное имя для юзера БЕЗ @username.
-    Обычный @username (тип 'mention') не содержит объект User в entity — только текст.
-    """
     if not message or not message.from_user:
         return
 
     fu = message.from_user
     await ensure_user(fu.id, fu.username)
 
-    # ФИКС ДЛЯ ГРУПП: сохраняем всех упомянутых через text_mention
     if message.entities:
         for entity in message.entities:
-            # text_mention — кликабельное имя; содержит полный объект User с ID
             if entity.type == "text_mention" and entity.user:
                 u = entity.user
                 await ensure_user(u.id, u.username)
 
 
 async def save_reply_user(message: Message):
-    """Сохраняет юзера из reply_to_message если есть."""
     if message.reply_to_message and message.reply_to_message.from_user:
         ru = message.reply_to_message.from_user
         if not ru.is_bot:
@@ -132,7 +114,6 @@ async def save_reply_user(message: Message):
 
 
 async def get_user_id(identifier: str):
-    """Получает user_id по @username или числовому ID."""
     if identifier.isdigit():
         return int(identifier)
 
@@ -148,10 +129,6 @@ async def get_user_id(identifier: str):
 
 
 def get_text_mention_target(message: Message):
-    """
-    Извлекает user_id из первого text_mention entity в сообщении.
-    Нужно для команд вида /add @Имя 100 когда у юзера нет @username.
-    """
     if not message.entities:
         return None
     for entity in message.entities:
@@ -185,20 +162,18 @@ async def profile(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT nickname, balance, bank FROM users WHERE user_id = ?",
+            "SELECT nickname, balance FROM users WHERE user_id = ?",
             (uid,)
         ) as cur:
             row = await cur.fetchone()
 
     nick = row[0] if row and row[0] else "No name"
     bal = row[1] if row else 0
-    bank = row[2] if row else 0
 
     await message.answer(
         f"👤 <b>Профиль</b>\n\n"
         f"📛 Никнейм: <b>{nick}</b>\n"
-        f"💰 Баланс: <b>{bal:.2f}$</b>\n"
-        f"🏦 Банк: <b>{bank:.2f}$</b>"
+        f"💰 Баланс: <b>{bal:.2f}$</b>"
     )
 
 
@@ -250,7 +225,6 @@ async def add(message: Message):
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /add @user 100\nИли ответь на сообщение игрока: /add 100")
 
-        # ФИКС: сначала пробуем text_mention (юзер без @username)
         target = get_text_mention_target(message)
         if target is None:
             target = await get_user_id(parts[1])
@@ -300,7 +274,6 @@ async def take(message: Message):
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /take @user 100\nИли ответь на сообщение игрока: /take 100")
 
-        # ФИКС: сначала пробуем text_mention
         target = get_text_mention_target(message)
         if target is None:
             target = await get_user_id(parts[1])
@@ -409,7 +382,6 @@ async def pay(message: Message):
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /pay @user 100\nИли ответь на сообщение игрока: /pay 100")
 
-        # ФИКС: сначала пробуем text_mention
         target = get_text_mention_target(message)
         if target is None:
             target = await get_user_id(parts[1])
@@ -529,8 +501,7 @@ async def history(message: Message):
     total_pages = (total + limit - 1) // limit
 
     icons = {
-        "PAY": "💸", "ADD": "➕", "TAKE": "➖",
-        "WITHDRAW": "🏧", "DEPOSIT": "🏦", "BANKWITHDRAW": "🏦",
+        "PAY": "💸", "ADD": "➕", "TAKE": "➖", "WITHDRAW": "🏧",
     }
 
     text = f"📋 <b>Транзакции — страница {page}/{total_pages}</b>\n\n"
@@ -546,84 +517,6 @@ async def history(message: Message):
     await message.answer(text)
 
 
-@dp.message(Command("deposit"))
-async def deposit(message: Message):
-    await save_user(message)
-    uid = message.from_user.id
-
-    parts = message.text.split()
-    if len(parts) < 2:
-        return await message.answer("⚠️ Использование: /deposit 100")
-
-    try:
-        amount = float(parts[1])
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
-
-    if amount <= 0:
-        return await message.answer("⚠️ Сумма должна быть > 0")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT balance FROM users WHERE user_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bal = row[0] if row else 0
-
-        if bal < amount:
-            return await message.answer("❌ Недостаточно средств на балансе")
-
-        await db.execute(
-            "UPDATE users SET balance = balance - ?, bank = bank + ? WHERE user_id = ?",
-            (amount, amount, uid)
-        )
-        await log_transaction(db, "DEPOSIT", from_user=uid, to_user=None, amount=amount)
-        await db.commit()
-
-    logger.info(f"🏦 /deposit — user={uid} amount={amount}")
-    await message.answer(f"🏦 Положено в банк: <b>+{amount:.2f}$</b>")
-
-
-@dp.message(Command("bankwithdraw"))
-async def bankwithdraw(message: Message):
-    await save_user(message)
-    uid = message.from_user.id
-
-    parts = message.text.split()
-    if len(parts) < 2:
-        return await message.answer("⚠️ Использование: /bankwithdraw 100")
-
-    try:
-        amount = float(parts[1])
-    except ValueError:
-        return await message.answer("⚠️ Неверная сумма")
-
-    if amount <= 0:
-        return await message.answer("⚠️ Сумма должна быть > 0")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT bank FROM users WHERE user_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bank = row[0] if row else 0
-
-        if bank < amount:
-            return await message.answer("❌ Недостаточно средств в банке")
-
-        await db.execute(
-            "UPDATE users SET bank = bank - ?, balance = balance + ? WHERE user_id = ?",
-            (amount, amount, uid)
-        )
-        await log_transaction(db, "BANKWITHDRAW", from_user=uid, to_user=None, amount=amount)
-        await db.commit()
-
-    logger.info(f"🏦 /bankwithdraw — user={uid} amount={amount}")
-    await message.answer(f"💰 Снято из банка: <b>+{amount:.2f}$</b>")
-
-
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     logger.info(f"❓ /help — user={message.from_user.id}")
@@ -631,8 +524,6 @@ async def help_cmd(message: Message):
         "📖 <b>Список команд</b>\n\n"
         "👤 /profile — твой профиль\n"
         "✏️ /nick &lt;имя&gt; — сменить никнейм\n"
-        "💰 /deposit &lt;сумма&gt; — положить в банк\n"
-        "🏦 /bankwithdraw &lt;сумма&gt; — снять из банка\n"
         "💸 /withdraw &lt;сумма&gt; — вывести деньги\n"
         "💳 /pay @user &lt;сумма&gt; — перевести деньги\n"
         "🏆 /top — топ игроков\n\n"
@@ -666,7 +557,6 @@ async def checkprofile(message: Message):
         if len(parts) < 2:
             return await message.answer("⚠️ Использование: /checkprofile @user\nИли ответь на сообщение игрока: /checkprofile")
 
-        # ФИКС: сначала пробуем text_mention
         target = get_text_mention_target(message)
         if target is None:
             target = await get_user_id(parts[1])
@@ -679,7 +569,7 @@ async def checkprofile(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT nickname, balance, bank FROM users WHERE user_id = ?", (target,)
+            "SELECT nickname, balance FROM users WHERE user_id = ?", (target,)
         ) as cur:
             row = await cur.fetchone()
 
@@ -694,16 +584,14 @@ async def checkprofile(message: Message):
 
     nick = row[0] if row and row[0] else "No name"
     bal = row[1] if row else 0
-    bank = row[2] if row else 0
 
-    icons = {"PAY": "💸", "ADD": "➕", "TAKE": "➖", "WITHDRAW": "🏧", "DEPOSIT": "🏦", "BANKWITHDRAW": "🏦"}
+    icons = {"PAY": "💸", "ADD": "➕", "TAKE": "➖", "WITHDRAW": "🏧"}
 
     text = (
         f"👤 <b>Профиль пользователя</b>\n\n"
         f"🆔 ID: <code>{target}</code>\n"
         f"📛 Никнейм: <b>{nick}</b>\n"
         f"💰 Баланс: <b>{bal:.2f}$</b>\n"
-        f"🏦 Банк: <b>{bank:.2f}$</b>\n"
     )
 
     if tx_rows:
@@ -747,7 +635,6 @@ async def reset_usernames(message: Message):
 
 @dp.message(Command("resetdb_full_x9q"))
 async def reset_db_full(message: Message):
-    """Полный сброс БД — удаляет всех юзеров и username маппинги. Балансы тоже слетят."""
     await save_user(message)
     uid = message.from_user.id
 
@@ -805,11 +692,11 @@ async def reset_all_balances(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT COUNT(*) FROM users WHERE balance > 0 OR bank > 0"
+            "SELECT COUNT(*) FROM users WHERE balance > 0"
         ) as cur:
             count = (await cur.fetchone())[0]
 
-        await db.execute("UPDATE users SET balance = 0, bank = 0")
+        await db.execute("UPDATE users SET balance = 0")
         await log_transaction(db, "RESET_ALL", from_user=uid, to_user=None, amount=0)
         await db.commit()
 
@@ -822,7 +709,6 @@ async def reset_all_balances(message: Message):
 
 @dp.message(F.from_user)
 async def track(message: Message):
-    """Автоматически сохраняет любого юзера который пишет в чат (включая группы)."""
     await save_user(message)
 
 
